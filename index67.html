@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High Fidelity Hologram</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000000;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        #input_video, #analysis_canvas { display: none; }
+
+        canvas#output_canvas {
+            position: absolute;
+            left: 0; top: 0;
+            width: 100%; height: 100%;
+        }
+
+        #loading {
+            position: absolute;
+            color: #ffffff;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 14px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            text-align: center;
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+    
+    <!-- MediaPipe Selfie Segmentation -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">
+        Yüksek Çözünürlüklü Nokta Bulutu Oluşturuluyor...<br>
+        <span style="font-size:10px; opacity:0.7">Lütfen kameraya izin verin</span>
+    </div>
+    
+    <video id="input_video"></video>
+    <canvas id="analysis_canvas"></canvas>
+    <canvas id="output_canvas"></canvas>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const analysisCanvas = document.getElementById('analysis_canvas');
+    const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
+    const outputCanvas = document.getElementById('output_canvas');
+    const ctx = outputCanvas.getContext('2d');
+    const loadingMsg = document.getElementById('loading');
+
+    // --- AYARLAR ---
+    
+    // Analiz çözünürlüğü: Ne kadar yüksekse o kadar net, ama işlemciyi yorar.
+    // 480p ideal bir denge sağlar.
+    const PROCESS_WIDTH = 480; 
+    const PROCESS_HEIGHT = 270; 
+    
+    // Grid Aralığı: Noktalar arası mesafe. Düşük = Daha net görüntü.
+    const GRID_STEP = 3; 
+
+    // Akış Hızı: Çok yavaş istendiği için düşürüldü.
+    const FLOW_SPEED = 0.8; 
+    
+    let flowParticles = []; // Hareket edenler
+    const MAX_FLOW_PARTICLES = 6000; // Sadece arkadaki izler için limit
+
+    function resizeCanvas() {
+        outputCanvas.width = window.innerWidth;
+        outputCanvas.height = window.innerHeight;
+        analysisCanvas.width = PROCESS_WIDTH;
+        analysisCanvas.height = PROCESS_HEIGHT;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- AKIŞKAN PARÇACIK SINIFI (ARKADAKİ İZLER) ---
+    class FlowParticle {
+        constructor(x, y, brightness, direction) {
+            this.x = x;
+            this.y = y;
+            this.initialY = y;
+            this.life = 1.0;
+            this.size = Math.random() * 1.5 + 0.5;
+            this.speedX = (Math.random() * 0.5 + FLOW_SPEED) * direction;
+            this.speedY = (Math.random() - 0.5) * 0.2; // Çok hafif titreme
+            
+            // Parlak bölgelerden çıkan parçacıklar daha uzun yaşar
+            this.decay = 0.005 + (1 - brightness/255) * 0.01; 
+        }
+
+        update() {
+            this.x += this.speedX;
+            this.y += this.speedY;
+            this.life -= this.decay;
+        }
+
+        draw(c) {
+            c.fillStyle = `rgba(255, 255, 255, ${this.life * 0.6})`; // Arkada silik kalsınlar
+            c.beginPath();
+            c.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+            c.fill();
+        }
+    }
+
+    // --- ANA İŞLEM DÖNGÜSÜ ---
+    
+    function onResults(results) {
+        loadingMsg.style.display = 'none';
+
+        // 1. Analiz Canvasına Görüntüyü Hazırla
+        // Görüntüyü aynala ve çiz
+        analysisCtx.save();
+        analysisCtx.scale(-1, 1);
+        analysisCtx.translate(-PROCESS_WIDTH, 0);
+        analysisCtx.drawImage(results.image, 0, 0, PROCESS_WIDTH, PROCESS_HEIGHT);
+        analysisCtx.restore();
+
+        // 2. Arkaplanı Temizle (Maske ile)
+        analysisCtx.globalCompositeOperation = 'destination-in';
+        analysisCtx.save();
+        analysisCtx.scale(-1, 1);
+        analysisCtx.translate(-PROCESS_WIDTH, 0);
+        analysisCtx.drawImage(results.segmentationMask, 0, 0, PROCESS_WIDTH, PROCESS_HEIGHT);
+        analysisCtx.restore();
+        analysisCtx.globalCompositeOperation = 'source-over';
+
+        // 3. Veriyi Oku
+        const imageData = analysisCtx.getImageData(0, 0, PROCESS_WIDTH, PROCESS_HEIGHT);
+        const data = imageData.data;
+
+        // 4. Çizim Hazırlığı (Ana Canvas)
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, outputCanvas.width, outputCanvas.height);
+        
+        // Akışkanları çiz (Arkada kalsınlar)
+        ctx.globalCompositeOperation = 'lighter'; // Glow efekti
+        drawFlowParticles();
+
+        // 5. SABİT NOKTA BULUTU OLUŞTURMA (Hologram)
+        // Pikselleri tara ve doğrudan noktaya çevir
+        
+        // Ölçekleme çarpanları
+        const scaleX = outputCanvas.width / PROCESS_WIDTH;
+        const scaleY = outputCanvas.height / PROCESS_HEIGHT;
+
+        // 5 Bölge Yüksekliği
+        const zoneHeight = outputCanvas.height / 5;
+
+        for (let y = 0; y < PROCESS_HEIGHT; y += GRID_STEP) {
+            for (let x = 0; x < PROCESS_WIDTH; x += GRID_STEP) {
+                
+                const index = (y * PROCESS_WIDTH + x) * 4;
+                const alpha = data[index + 3];
+
+                // Eğer burası vücut parçasıysa
+                if (alpha > 100) {
+                    const r = data[index];
+                    const g = data[index + 1];
+                    const b = data[index + 2];
+                    
+                    // Parlaklık hesapla (Siyah beyaz dönüşüm)
+                    const brightness = (r + g + b) / 3;
+
+                    // Koordinatları hesapla
+                    const finalX = x * scaleX;
+                    const finalY = y * scaleY;
+
+                    // --- KATMAN 1: SABİT NET GÖRÜNTÜ ---
+                    // Parlaklığa göre nokta boyutu ve opaklığı ayarla
+                    // Bu kısım senin "net görmeni" sağlar.
+                    if (brightness > 20) { // Çok karanlık yerleri çizme
+                        const dotSize = (brightness / 255) * 1.8; // Parlak yerler büyük nokta
+                        const opacity = (brightness / 255);       // Parlak yerler daha net
+                        
+                        ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+                        ctx.beginPath();
+                        ctx.arc(finalX, finalY, dotSize, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    // --- KATMAN 2: AKIŞKAN PARÇACIK ÜRETİMİ ---
+                    // Rastgele bazı noktalardan "toz" kopar
+                    // Kenarlardan veya parlak yerlerden kopma şansı daha yüksek
+                    if (Math.random() < 0.02) { 
+                        
+                        // Yön belirleme (5 Bölge)
+                        const zoneIndex = Math.floor(finalY / zoneHeight);
+                        let direction = 1; // Sağ (Varsayılan: 1, 3, 5. bölgeler - index 0,2,4)
+                        
+                        // 2. ve 4. Bölgeler (Index 1 ve 3) Sola gitsin
+                        if (zoneIndex === 1 || zoneIndex === 3) {
+                            direction = -1;
+                        }
+
+                        if (flowParticles.length < MAX_FLOW_PARTICLES) {
+                            flowParticles.push(new FlowParticle(finalX, finalY, brightness, direction));
+                        }
+                    }
+                }
+            }
+        }
+        
+        ctx.globalCompositeOperation = 'source-over';
+    }
+
+    function drawFlowParticles() {
+        for (let i = flowParticles.length - 1; i >= 0; i--) {
+            const p = flowParticles[i];
+            p.update();
+            p.draw(ctx);
+            if (p.life <= 0) {
+                flowParticles.splice(i, 1);
+            }
+        }
+    }
+
+    const selfieSegmentation = new SelfieSegmentation({locateFile: (file) => 
+        `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`});
+
+    selfieSegmentation.setOptions({
+        modelSelection: 1, // 1 = Landscape (Daha iyi kalite)
+        minDetectionConfidence: 0.5
+    });
+
+    selfieSegmentation.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await selfieSegmentation.send({image: videoElement}); },
+        width: 640, height: 360
+    });
+    camera.start();
+
+</script>
+</body>
+</html>
